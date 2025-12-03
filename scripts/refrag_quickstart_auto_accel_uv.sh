@@ -17,10 +17,11 @@ LR_POLICY="${LR_POLICY:-1e-4}"
 # ================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_DIR"
 
-if [[ ! -f "refrag.py" ]]; then
-  echo "ERROR: refrag.py not found in $SCRIPT_DIR. Place refrag.py next to this script."
+if [[ ! -f "src/refrag.py" ]]; then
+  echo "ERROR: src/refrag.py not found in $PROJECT_DIR."
   exit 1
 fi
 
@@ -34,9 +35,9 @@ else
   exit 1
 fi
 
-$PY -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
+# $PY -m venv .venv
+# source .venv/bin/activate
+# uv pip install --upgrade pip
 
 # ---- Detect accelerator and install Torch accordingly ----
 OS="$(uname -s)"
@@ -50,25 +51,25 @@ echo "Detected OS: $OS; NVIDIA: $HAS_NVIDIA; ROCm: $HAS_ROCM"
 
 if [[ "$OS" == "Linux" && "$HAS_NVIDIA" == "1" ]]; then
   echo "Installing PyTorch CUDA (cu121)"
-  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
   echo "Trying faiss-gpu, falling back to faiss-cpu if needed..."
-  (pip install faiss-gpu && echo "faiss-gpu installed") || (pip install faiss-cpu && echo "faiss-cpu installed")
+  (uv pip install faiss-gpu && echo "faiss-gpu installed") || (uv pip install faiss-cpu && echo "faiss-cpu installed")
 elif [[ "$OS" == "Linux" && "$HAS_ROCM" == "1" ]]; then
   echo "Installing PyTorch ROCm (rocm6.0) and faiss-cpu"
-  pip install --index-url https://download.pytorch.org/whl/rocm6.0 torch torchvision torchaudio
-  pip install faiss-cpu
+  uv pip install --index-url https://download.pytorch.org/whl/rocm6.0 torch torchvision torchaudio
+  uv pip install faiss-cpu
 elif [[ "$OS" == "Darwin" ]]; then
   echo "Installing PyTorch for macOS (MPS supported if on Apple Silicon/macOS 12.3+)"
-  pip install torch torchvision torchaudio
-  pip install faiss-cpu
+  uv pip install torch torchvision torchaudio
+  uv pip install faiss-cpu
 else
   echo "Installing CPU-only PyTorch"
-  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-  pip install faiss-cpu
+  uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+  uv pip install faiss-cpu
 fi
 
 # Common deps
-pip install "transformers==4.43.3" accelerate sentencepiece sacrebleu numpy
+uv pip install "transformers==4.43.3" accelerate sentencepiece sacrebleu numpy
 
 # ---- Patch refrag.py to use MPS if available (and keep CUDA/CPU fallback) ----
 python - <<'PY'
@@ -96,24 +97,26 @@ PY
 # Perf/env niceties
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_ENABLE_MPS_FALLBACK=1
+export KMP_DUPLICATE_LIB_OK=TRUE
+
 
 # 1) Toy corpus + index
 mkdir -p data runs/index
-cat > data/wiki_lines.txt << 'EOF'
-Alexander Fleming discovered penicillin in 1928 at St. Mary's Hospital in London.
-The capital of France is Paris.
-Alan Turing proposed the Turing test in 1950.
-Penicillin is an antibiotic derived from Penicillium fungi.
-Large language models can use retrieval to augment their context.
-EOF
+# cat > data/wiki_lines.txt << 'EOF'
+# Alexander Fleming discovered penicillin in 1928 at St. Mary's Hospital in London.
+# The capital of France is Paris.
+# Alan Turing proposed the Turing test in 1950.
+# Penicillin is an antibiotic derived from Penicillium fungi.
+# Large language models can use retrieval to augment their context.
+# EOF
 
-python refrag.py index \
-  --corpus data/wiki_lines.txt \
+python src/refrag.py index \
+  --corpus data/corpus_large.txt \
   --index_dir runs/index \
   --embed_model "${EMBED_MODEL}"
 
 # 2) Quick generate
-python refrag.py generate \
+python src/refrag.py generate \
   --index_dir runs/index \
   --embed_model "${EMBED_MODEL}" \
   --enc "${ENC_MODEL}" \
@@ -126,15 +129,28 @@ python refrag.py generate \
   --max_new ${MAX_NEW} \
   --temperature 0.0
 
+python src/refrag.py generate \
+  --index_dir runs/index \
+  --embed_model "${EMBED_MODEL}" \
+  --enc "${ENC_MODEL}" \
+  --dec "${DEC_MODEL}" \
+  --question "Which river flows through City_19?" \
+  --topk ${TOPK} \
+  --k ${K} \
+  --p ${P} \
+  --ctx_max ${CTX_MAX} \
+  --max_new ${MAX_NEW} \
+  --temperature 0.0
+
 # 3) CPT datasets
-cat > data/cpt_train.jsonl << 'EOF'
-{"id":"ex1","tokens":"Penicillin revolutionized medicine by enabling treatment of bacterial infections.","split":{"s":1024,"o":128}}
-{"id":"ex2","tokens":"Alan Turing's work laid the foundations of computer science and artificial intelligence.","split":{"s":1024,"o":128}}
-{"id":"ex3","tokens":"Paris is the capital and most populous city of France, known for art, fashion, and gastronomy.","split":{"s":1024,"o":128}}
-EOF
+# cat > data/cpt_train.jsonl << 'EOF'
+# {"id":"ex1","tokens":"Penicillin revolutionized medicine by enabling treatment of bacterial infections.","split":{"s":1024,"o":128}}
+# {"id":"ex2","tokens":"Alan Turing's work laid the foundations of computer science and artificial intelligence.","split":{"s":1024,"o":128}}
+# {"id":"ex3","tokens":"Paris is the capital and most populous city of France, known for art, fashion, and gastronomy.","split":{"s":1024,"o":128}}
+# EOF
 
 # 3A) Reconstruction
-python refrag.py cpt_recon \
+python src/refrag.py cpt_recon \
   --train_json data/cpt_train.jsonl \
   --enc "${ENC_MODEL}" \
   --dec "${DEC_MODEL}" \
@@ -145,7 +161,7 @@ python refrag.py cpt_recon \
   --out_dir runs/cpt_recon
 
 # 3B) Next-paragraph
-python refrag.py cpt_next \
+python src/refrag.py cpt_next \
   --train_json data/cpt_train.jsonl \
   --enc "${ENC_MODEL}" \
   --dec "${DEC_MODEL}" \
@@ -158,12 +174,12 @@ python refrag.py cpt_next \
   --out_dir runs/cpt_next
 
 # 4) Policy training
-cat > data/rag_train.jsonl << 'EOF'
-{"id":"q1","question":"Who discovered penicillin?","answers":["Alexander Fleming"]}
-{"id":"q2","question":"What is the capital of France?","answers":["Paris"]}
-EOF
+# cat > data/rag_train.jsonl << 'EOF'
+# {"id":"q1","question":"Who discovered penicillin?","answers":["Alexander Fleming"]}
+# {"id":"q2","question":"What is the capital of France?","answers":["Paris"]}
+# EOF
 
-python refrag.py train_policy \
+python src/refrag.py train_policy \
   --rag_json data/rag_train.jsonl \
   --index_dir runs/index \
   --embed_model "${EMBED_MODEL}" \
@@ -178,7 +194,7 @@ python refrag.py train_policy \
   --out_dir runs/policy
 
 echo "---- Generate with trained policy ----"
-python refrag.py generate \
+python src/refrag.py generate \
   --index_dir runs/index \
   --embed_model "${EMBED_MODEL}" \
   --enc "${ENC_MODEL}" \
@@ -187,8 +203,22 @@ python refrag.py generate \
   --question "Explain how penicillin was discovered and by whom." \
   --topk ${TOPK} --k ${K} --p ${P} --max_new 192
 
+python src/refrag.py generate \
+  --index_dir runs/index \
+  --embed_model "${EMBED_MODEL}" \
+  --enc "${ENC_MODEL}" \
+  --dec "${DEC_MODEL}" \
+  --load_dir runs/policy \
+  --question "Which river flows through City_19?" \
+  --topk ${TOPK} \
+  --k ${K} \
+  --p ${P} \
+  --ctx_max ${CTX_MAX} \
+  --max_new ${MAX_NEW} \
+  --temperature 0.0
+
 echo "---- Generate with CPT-tuned full model ----"
-python refrag.py generate \
+python src/refrag.py generate \
   --index_dir runs/index \
   --embed_model "${EMBED_MODEL}" \
   --enc "${ENC_MODEL}" \
