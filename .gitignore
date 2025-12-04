@@ -1,5 +1,6 @@
 # Exclude dir
 runs
+data/bnwiki
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -30,12 +30,75 @@ import time
 import argparse
 from typing import List, Tuple, Dict, Optional
 from pathlib import Path
+from datetime import datetime
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+
+
+# ----------------------------
+# MLflow (optional)
+# ----------------------------
+
+try:
+    import mlflow
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    mlflow = None
+
+
+def ensure_mlflow():
+    if not MLFLOW_AVAILABLE:
+        raise RuntimeError("MLflow not installed. Run: pip install mlflow")
+
+
+class MLflowTracker:
+    """MLflow experiment tracking wrapper for RAG."""
+
+    def __init__(
+        self,
+        tracking_uri: str = "mlruns",
+        experiment_name: str = "RAG_Baseline",
+        run_name: Optional[str] = None
+    ):
+        ensure_mlflow()
+        self.tracking_uri = tracking_uri
+        self.experiment_name = experiment_name
+        self.run_name = run_name or f"rag_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.run = None
+
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment(experiment_name)
+
+    def start_run(self, params: Optional[Dict] = None):
+        """Start MLflow run and log parameters."""
+        self.run = mlflow.start_run(run_name=self.run_name)
+        if params:
+            mlflow.log_params(params)
+        print(f"[MLflow] Started run: {self.run_name}")
+        return self.run
+
+    def log_params(self, params: Dict):
+        """Log parameters."""
+        mlflow.log_params(params)
+
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
+        """Log metrics."""
+        mlflow.log_metrics(metrics, step=step)
+
+    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None):
+        """Log artifact file."""
+        mlflow.log_artifact(local_path, artifact_path)
+
+    def end_run(self):
+        """End MLflow run."""
+        if self.run:
+            mlflow.end_run()
+            print("[MLflow] Ended run")
 
 
 # ----------------------------
@@ -390,98 +453,143 @@ def cmd_evaluate(args):
     """Evaluate RAG on a test set"""
     seed_everything()
 
-    # Load test data
-    print(f"[evaluate] Loading test data from {args.test_json}")
-    test_data = []
-    with open(args.test_json, 'r') as f:
-        for line in f:
-            if line.strip():
-                test_data.append(json.loads(line))
-
-    # Limit samples if specified
-    if args.max_samples and args.max_samples < len(test_data):
-        import random
-        random.shuffle(test_data)
-        test_data = test_data[:args.max_samples]
-
-    print(f"[evaluate] Evaluating on {len(test_data)} samples")
-
-    # Load index
-    index = QdrantIndex(args.index_dir).load()
-    encoder = PassageEncoder(args.embed_model)
-    generator = RAGGenerator(model_name=args.dec, max_ctx_tokens=args.ctx_max)
-
-    # Metrics
-    results = []
-    correct = 0
-    total_time = 0
-    total_tokens = 0
-
-    for i, item in enumerate(test_data):
-        question = item["question"]
-        expected_answers = item.get("answers", [])
-
-        # Retrieve
-        query_emb = encoder.encode_query(question)
-        passages, scores = index.search(query_emb, topk=args.topk)
-
-        # Generate
-        result = generator.generate(
-            question=question,
-            passages=passages,
-            max_new_tokens=args.max_new,
-            temperature=0.0  # Deterministic for eval
+    # Setup MLflow tracking if enabled
+    tracker = None
+    if args.use_mlflow:
+        tracker = MLflowTracker(
+            tracking_uri=args.mlflow_uri,
+            experiment_name=args.experiment,
+            run_name=f"eval_{args.run_name}"
         )
-
-        # Check accuracy (simple exact match)
-        answer = result["answer"].strip()
-        is_correct = any(
-            exp.lower() in answer.lower()
-            for exp in expected_answers
-        ) if expected_answers else None
-
-        if is_correct:
-            correct += 1
-
-        total_time += result["total_time_sec"]
-        total_tokens += result["num_tokens"]
-
-        results.append({
-            "id": item.get("id", i),
-            "question": question,
-            "expected": expected_answers,
-            "answer": answer,
-            "correct": is_correct,
-            "time_sec": result["total_time_sec"]
+        tracker.start_run(params={
+            "model": args.dec,
+            "embed_model": args.embed_model,
+            "topk": args.topk,
+            "ctx_max": args.ctx_max,
+            "max_new": args.max_new,
+            "max_samples": args.max_samples or "all"
         })
 
-        if (i + 1) % 10 == 0:
-            print(f"[evaluate] Progress: {i+1}/{len(test_data)}")
+    try:
+        # Load test data
+        print(f"[evaluate] Loading test data from {args.test_json}")
+        test_data = []
+        with open(args.test_json, 'r') as f:
+            for line in f:
+                if line.strip():
+                    test_data.append(json.loads(line))
 
-    # Summary
-    accuracy = correct / len(test_data) if test_data else 0
-    avg_time = total_time / len(test_data) if test_data else 0
-    throughput = total_tokens / total_time if total_time > 0 else 0
+        # Limit samples if specified
+        if args.max_samples and args.max_samples < len(test_data):
+            import random
+            random.shuffle(test_data)
+            test_data = test_data[:args.max_samples]
 
-    summary = {
-        "total_samples": len(test_data),
-        "correct": correct,
-        "accuracy": accuracy,
-        "avg_time_per_question_sec": avg_time,
-        "total_time_sec": total_time,
-        "throughput_tok_per_sec": throughput
-    }
+        print(f"[evaluate] Evaluating on {len(test_data)} samples")
 
-    print("\n" + "="*50)
-    print("EVALUATION RESULTS")
-    print("="*50)
-    print(json.dumps(summary, indent=2))
+        # Load index
+        index = QdrantIndex(args.index_dir).load()
+        encoder = PassageEncoder(args.embed_model)
+        generator = RAGGenerator(model_name=args.dec, max_ctx_tokens=args.ctx_max)
 
-    # Save detailed results
-    if args.output:
-        with open(args.output, 'w') as f:
-            json.dump({"summary": summary, "results": results}, f, indent=2)
-        print(f"\n[evaluate] Detailed results saved to {args.output}")
+        # Metrics
+        results = []
+        correct = 0
+        total_time = 0
+        total_tokens = 0
+
+        for i, item in enumerate(test_data):
+            question = item["question"]
+            expected_answers = item.get("answers", [])
+
+            # Retrieve
+            query_emb = encoder.encode_query(question)
+            passages, scores = index.search(query_emb, topk=args.topk)
+
+            # Generate
+            result = generator.generate(
+                question=question,
+                passages=passages,
+                max_new_tokens=args.max_new,
+                temperature=0.0  # Deterministic for eval
+            )
+
+            # Check accuracy (simple exact match)
+            answer = result["answer"].strip()
+            is_correct = any(
+                exp.lower() in answer.lower()
+                for exp in expected_answers
+            ) if expected_answers else None
+
+            if is_correct:
+                correct += 1
+
+            total_time += result["total_time_sec"]
+            total_tokens += result["num_tokens"]
+
+            results.append({
+                "id": item.get("id", i),
+                "question": question,
+                "expected": expected_answers,
+                "answer": answer,
+                "correct": is_correct,
+                "time_sec": result["total_time_sec"]
+            })
+
+            if (i + 1) % 10 == 0:
+                current_acc = correct / (i + 1)
+                print(f"[evaluate] Progress: {i+1}/{len(test_data)} | Accuracy: {current_acc:.2%}")
+
+                # Log intermediate metrics to MLflow
+                if tracker:
+                    tracker.log_metrics({
+                        "running_accuracy": current_acc,
+                        "samples_processed": i + 1
+                    }, step=i + 1)
+
+        # Summary
+        accuracy = correct / len(test_data) if test_data else 0
+        avg_time = total_time / len(test_data) if test_data else 0
+        throughput = total_tokens / total_time if total_time > 0 else 0
+
+        summary = {
+            "total_samples": len(test_data),
+            "correct": correct,
+            "accuracy": accuracy,
+            "avg_time_per_question_sec": avg_time,
+            "total_time_sec": total_time,
+            "throughput_tok_per_sec": throughput
+        }
+
+        print("\n" + "="*50)
+        print("EVALUATION RESULTS")
+        print("="*50)
+        print(json.dumps(summary, indent=2))
+
+        # Log final metrics to MLflow
+        if tracker:
+            tracker.log_metrics({
+                "accuracy": accuracy,
+                "avg_time_per_question_sec": avg_time,
+                "total_time_sec": total_time,
+                "throughput_tok_per_sec": throughput,
+                "total_samples": len(test_data),
+                "correct": correct
+            })
+
+        # Save detailed results
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump({"summary": summary, "results": results}, f, indent=2)
+            print(f"\n[evaluate] Detailed results saved to {args.output}")
+
+            # Log results file as artifact
+            if tracker:
+                tracker.log_artifact(args.output)
+
+    finally:
+        if tracker:
+            tracker.end_run()
 
 
 # ----------------------------
@@ -525,6 +633,11 @@ def build_argparser():
     sp.add_argument("--max_new", type=int, default=128)
     sp.add_argument("--max_samples", type=int, default=None, help="Max samples to evaluate")
     sp.add_argument("--output", type=str, default=None, help="Output file for detailed results")
+    # MLflow arguments
+    sp.add_argument("--use-mlflow", action="store_true", help="Enable MLflow tracking")
+    sp.add_argument("--mlflow-uri", type=str, default="mlruns", help="MLflow tracking URI")
+    sp.add_argument("--experiment", type=str, default="RAG_Baseline", help="MLflow experiment name")
+    sp.add_argument("--run-name", type=str, default="run", help="MLflow run name")
     sp.set_defaults(func=cmd_evaluate)
 
     return p

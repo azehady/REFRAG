@@ -51,6 +51,7 @@ Author: Matthew Combatti - Simulanics Technologies
 import os, sys, json, math, time, random, argparse
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -68,6 +69,71 @@ try:
     import faiss  # pip install faiss-cpu
 except Exception:
     faiss = None
+
+# ----------------------------
+# MLflow (optional)
+# ----------------------------
+
+try:
+    import mlflow
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    mlflow = None
+
+
+def ensure_mlflow():
+    if not MLFLOW_AVAILABLE:
+        raise RuntimeError("MLflow not installed. Run: pip install mlflow")
+
+
+class MLflowTracker:
+    """MLflow experiment tracking wrapper for REFRAG."""
+
+    def __init__(
+        self,
+        tracking_uri: str = "mlruns",
+        experiment_name: str = "REFRAG",
+        run_name: Optional[str] = None
+    ):
+        ensure_mlflow()
+        self.tracking_uri = tracking_uri
+        self.experiment_name = experiment_name
+        self.run_name = run_name or f"refrag_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.run = None
+
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment(experiment_name)
+
+    def start_run(self, params: Optional[Dict] = None):
+        """Start MLflow run and log parameters."""
+        self.run = mlflow.start_run(run_name=self.run_name)
+        if params:
+            mlflow.log_params(params)
+        print(f"[MLflow] Started run: {self.run_name}")
+        return self.run
+
+    def log_params(self, params: Dict):
+        """Log parameters."""
+        mlflow.log_params(params)
+
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
+        """Log metrics."""
+        mlflow.log_metrics(metrics, step=step)
+
+    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None):
+        """Log artifact file."""
+        mlflow.log_artifact(local_path, artifact_path)
+
+    def log_model(self, model_dir: str, artifact_path: str = "model"):
+        """Log model directory as artifact."""
+        mlflow.log_artifacts(model_dir, artifact_path)
+
+    def end_run(self):
+        """End MLflow run."""
+        if self.run:
+            mlflow.end_run()
+            print("[MLflow] Ended run")
 
 
 # ----------------------------
@@ -607,38 +673,79 @@ def cmd_cpt_recon(args):
         lr=args.lr,
         fp16=False,
     )
-    model = REFRAG(cfg).to(now_device())
-    # Freeze decoder; train encoder+projector
-    for p in model.decoder.parameters():
-        p.requires_grad = False
-    params = list(model.encoder.parameters()) + list(model.projector.parameters())
-    steps = args.steps
-    opt, sch = setup_optim(params, lr=cfg.lr, wd=cfg.wd, total_steps=steps)
 
-    data = list(load_jsonl(args.train_json))
-    if len(data) == 0:
-        print("[cpt_recon] no data.")
-        return
+    # Setup MLflow tracking if enabled
+    tracker = None
+    if args.use_mlflow:
+        tracker = MLflowTracker(
+            tracking_uri=args.mlflow_uri,
+            experiment_name=args.experiment,
+            run_name=f"recon_{args.run_name}"
+        )
+        tracker.start_run(params={
+            "encoder": args.enc,
+            "decoder": args.dec,
+            "chunk_len_k": args.k,
+            "lr": args.lr,
+            "steps": args.steps,
+            "phase": "reconstruction"
+        })
 
-    model.train()
-    for step in range(steps):
-        ex = random.choice(data)
-        text = ex["tokens"]
-        chunk_strs, _ = model._chunk_text(text, k_tokens=cfg.chunk_len_tokens)
-        max_chunks = max(1, len(chunk_strs))
-        cap = curriculum_schedule(steps, max_chunks)[step]
-        loss = model.loss_reconstruction(text, k=cfg.chunk_len_tokens, num_chunks_cap=cap)
-        opt.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-        opt.step(); sch.step()
-        if step % max(1, args.log_every) == 0:
-            print(f"[cpt_recon] step {step}/{steps} loss={loss.item():.4f}")
+    try:
+        model = REFRAG(cfg).to(now_device())
+        # Freeze decoder; train encoder+projector
+        for p in model.decoder.parameters():
+            p.requires_grad = False
+        params = list(model.encoder.parameters()) + list(model.projector.parameters())
+        steps = args.steps
+        opt, sch = setup_optim(params, lr=cfg.lr, wd=cfg.wd, total_steps=steps)
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    torch.save(model.encoder.state_dict(), os.path.join(args.out_dir, "encoder.pt"))
-    torch.save(model.projector.state_dict(), os.path.join(args.out_dir, "projector.pt"))
-    print(f"[cpt_recon] saved to {args.out_dir}")
+        data = list(load_jsonl(args.train_json))
+        if len(data) == 0:
+            print("[cpt_recon] no data.")
+            return
+
+        model.train()
+        running_loss = 0.0
+        for step in range(steps):
+            ex = random.choice(data)
+            text = ex["tokens"]
+            chunk_strs, _ = model._chunk_text(text, k_tokens=cfg.chunk_len_tokens)
+            max_chunks = max(1, len(chunk_strs))
+            cap = curriculum_schedule(steps, max_chunks)[step]
+            loss = model.loss_reconstruction(text, k=cfg.chunk_len_tokens, num_chunks_cap=cap)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            opt.step(); sch.step()
+
+            running_loss += loss.item()
+
+            if step % max(1, args.log_every) == 0:
+                avg_loss = running_loss / max(1, args.log_every)
+                print(f"[cpt_recon] step {step}/{steps} loss={loss.item():.4f}")
+
+                if tracker:
+                    tracker.log_metrics({
+                        "reconstruction_loss": loss.item(),
+                        "avg_loss": avg_loss,
+                        "curriculum_cap": cap,
+                        "learning_rate": sch.get_last_lr()[0]
+                    }, step=step)
+
+                running_loss = 0.0
+
+        os.makedirs(args.out_dir, exist_ok=True)
+        torch.save(model.encoder.state_dict(), os.path.join(args.out_dir, "encoder.pt"))
+        torch.save(model.projector.state_dict(), os.path.join(args.out_dir, "projector.pt"))
+        print(f"[cpt_recon] saved to {args.out_dir}")
+
+        if tracker:
+            tracker.log_model(args.out_dir, "reconstruction_model")
+
+    finally:
+        if tracker:
+            tracker.end_run()
 
 
 def cmd_cpt_next(args):
@@ -650,42 +757,83 @@ def cmd_cpt_next(args):
         lr=args.lr,
         fp16=False,
     )
-    model = REFRAG(cfg).to(now_device())
-    # Load from recon phase if provided
-    if args.load_dir:
-        enc_p = os.path.join(args.load_dir, "encoder.pt")
-        proj_p = os.path.join(args.load_dir, "projector.pt")
-        if os.path.exists(enc_p):
-            model.encoder.load_state_dict(torch.load(enc_p, map_location=now_device()))
-        if os.path.exists(proj_p):
-            model.projector.load_state_dict(torch.load(proj_p, map_location=now_device()))
-        print("[cpt_next] loaded encoder/projector init.")
 
-    params = list(model.parameters())  # unfreeze all
-    steps = args.steps
-    opt, sch = setup_optim(params, lr=cfg.lr, wd=cfg.wd, total_steps=steps)
-    data = list(load_jsonl(args.train_json))
-    if len(data) == 0:
-        print("[cpt_next] no data.")
-        return
+    # Setup MLflow tracking if enabled
+    tracker = None
+    if args.use_mlflow:
+        tracker = MLflowTracker(
+            tracking_uri=args.mlflow_uri,
+            experiment_name=args.experiment,
+            run_name=f"cpt_{args.run_name}"
+        )
+        tracker.start_run(params={
+            "encoder": args.enc,
+            "decoder": args.dec,
+            "chunk_len_k": args.k,
+            "lr": args.lr,
+            "steps": args.steps,
+            "expand_frac": args.expand_frac,
+            "phase": "cpt_next_para"
+        })
 
-    model.train()
-    for step in range(steps):
-        ex = random.choice(data)
-        text = ex["tokens"]
-        s = ex.get("split", {}).get("s", 2048)
-        o = ex.get("split", {}).get("o", 256)
-        loss = model.loss_next_para(text, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
-        opt.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-        opt.step(); sch.step()
-        if step % max(1, args.log_every) == 0:
-            print(f"[cpt_next] step {step}/{steps} loss={loss.item():.4f}")
+    try:
+        model = REFRAG(cfg).to(now_device())
+        # Load from recon phase if provided
+        if args.load_dir:
+            enc_p = os.path.join(args.load_dir, "encoder.pt")
+            proj_p = os.path.join(args.load_dir, "projector.pt")
+            if os.path.exists(enc_p):
+                model.encoder.load_state_dict(torch.load(enc_p, map_location=now_device()))
+            if os.path.exists(proj_p):
+                model.projector.load_state_dict(torch.load(proj_p, map_location=now_device()))
+            print("[cpt_next] loaded encoder/projector init.")
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.out_dir, "refrag_full.pt"))
-    print(f"[cpt_next] saved full model to {args.out_dir}")
+        params = list(model.parameters())  # unfreeze all
+        steps = args.steps
+        opt, sch = setup_optim(params, lr=cfg.lr, wd=cfg.wd, total_steps=steps)
+        data = list(load_jsonl(args.train_json))
+        if len(data) == 0:
+            print("[cpt_next] no data.")
+            return
+
+        model.train()
+        running_loss = 0.0
+        for step in range(steps):
+            ex = random.choice(data)
+            text = ex["tokens"]
+            s = ex.get("split", {}).get("s", 2048)
+            o = ex.get("split", {}).get("o", 256)
+            loss = model.loss_next_para(text, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            opt.step(); sch.step()
+
+            running_loss += loss.item()
+
+            if step % max(1, args.log_every) == 0:
+                avg_loss = running_loss / max(1, args.log_every)
+                print(f"[cpt_next] step {step}/{steps} loss={loss.item():.4f}")
+
+                if tracker:
+                    tracker.log_metrics({
+                        "cpt_loss": loss.item(),
+                        "avg_loss": avg_loss,
+                        "learning_rate": sch.get_last_lr()[0]
+                    }, step=step)
+
+                running_loss = 0.0
+
+        os.makedirs(args.out_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(args.out_dir, "refrag_full.pt"))
+        print(f"[cpt_next] saved full model to {args.out_dir}")
+
+        if tracker:
+            tracker.log_model(args.out_dir, "cpt_model")
+
+    finally:
+        if tracker:
+            tracker.end_run()
 
 
 def cmd_train_policy(args):
@@ -698,63 +846,107 @@ def cmd_train_policy(args):
         fp16=False,
         policy_hidden=args.policy_hidden,
     )
-    model = REFRAG(cfg).to(now_device())
-    # Optional warm-start
-    if args.load_dir:
-        try:
-            model.encoder.load_state_dict(torch.load(os.path.join(args.load_dir, "encoder.pt"), map_location=now_device()))
-            model.projector.load_state_dict(torch.load(os.path.join(args.load_dir, "projector.pt"), map_location=now_device()))
-            print("[train_policy] loaded encoder/projector init.")
-        except Exception:
-            pass
 
-    # Train policy only
-    for p in model.decoder.parameters():
-        p.requires_grad = False
-    for p in model.encoder.parameters():
-        p.requires_grad = False
-    for p in model.projector.parameters():
-        p.requires_grad = False
-    params = list(model.policy.parameters())
-    steps = args.steps
-    opt, sch = setup_optim(params, lr=cfg.lr, wd=cfg.wd, total_steps=steps)
+    # Setup MLflow tracking if enabled
+    tracker = None
+    if args.use_mlflow:
+        tracker = MLflowTracker(
+            tracking_uri=args.mlflow_uri,
+            experiment_name=args.experiment,
+            run_name=f"policy_{args.run_name}"
+        )
+        tracker.start_run(params={
+            "encoder": args.enc,
+            "decoder": args.dec,
+            "chunk_len_k": args.k,
+            "lr": args.lr,
+            "steps": args.steps,
+            "max_expand_frac": args.p,
+            "topk": args.topk,
+            "policy_hidden": args.policy_hidden,
+            "phase": "policy_training"
+        })
 
-    texts, index = load_index_bundle(args.index_dir)
-    qenc = PassageEncoder(args.embed_model)
+    try:
+        model = REFRAG(cfg).to(now_device())
+        # Optional warm-start
+        if args.load_dir:
+            try:
+                model.encoder.load_state_dict(torch.load(os.path.join(args.load_dir, "encoder.pt"), map_location=now_device()))
+                model.projector.load_state_dict(torch.load(os.path.join(args.load_dir, "projector.pt"), map_location=now_device()))
+                print("[train_policy] loaded encoder/projector init.")
+            except Exception:
+                pass
 
-    data = list(load_jsonl(args.rag_json))
-    if len(data) == 0:
-        print("[train_policy] no data.")
-        return
+        # Train policy only
+        for p in model.decoder.parameters():
+            p.requires_grad = False
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        for p in model.projector.parameters():
+            p.requires_grad = False
+        params = list(model.policy.parameters())
+        steps = args.steps
+        opt, sch = setup_optim(params, lr=cfg.lr, wd=cfg.wd, total_steps=steps)
 
-    baseline = None
-    beta = 0.9  # EMA
+        texts, index = load_index_bundle(args.index_dir)
+        qenc = PassageEncoder(args.embed_model)
 
-    model.train()
-    for step in range(steps):
-        ex = random.choice(data)
-        q = ex["question"]
-        qv = qenc.encode_query(q)
-        _, I = search_index(index, qv, args.topk)
-        passages = [texts[i] for i in I]
+        data = list(load_jsonl(args.rag_json))
+        if len(data) == 0:
+            print("[train_policy] no data.")
+            return
 
-        log_prob, reward = model.policy_step(q, passages, k=cfg.chunk_len_tokens, max_expand_frac=args.p)
-        r = reward.item()
-        baseline = r if baseline is None else (beta*baseline + (1-beta)*r)
-        advantage = r - baseline
+        baseline = None
+        beta = 0.9  # EMA
+        running_reward = 0.0
 
-        loss = -(log_prob * advantage)
-        opt.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-        opt.step(); sch.step()
+        model.train()
+        for step in range(steps):
+            ex = random.choice(data)
+            q = ex["question"]
+            qv = qenc.encode_query(q)
+            _, I = search_index(index, qv, args.topk)
+            passages = [texts[i] for i in I]
 
-        if step % max(1, args.log_every) == 0:
-            print(f"[train_policy] step {step}/{steps} reward={r:.4f} baseline={baseline:.4f} advantage={advantage:.4f}")
+            log_prob, reward = model.policy_step(q, passages, k=cfg.chunk_len_tokens, max_expand_frac=args.p)
+            r = reward.item()
+            baseline = r if baseline is None else (beta*baseline + (1-beta)*r)
+            advantage = r - baseline
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    torch.save(model.policy.state_dict(), os.path.join(args.out_dir, "policy.pt"))
-    print(f"[train_policy] saved policy to {args.out_dir}")
+            loss = -(log_prob * advantage)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            opt.step(); sch.step()
+
+            running_reward += r
+
+            if step % max(1, args.log_every) == 0:
+                avg_reward = running_reward / max(1, args.log_every)
+                print(f"[train_policy] step {step}/{steps} reward={r:.4f} baseline={baseline:.4f} advantage={advantage:.4f}")
+
+                if tracker:
+                    tracker.log_metrics({
+                        "reward": r,
+                        "avg_reward": avg_reward,
+                        "baseline": baseline,
+                        "advantage": advantage,
+                        "learning_rate": sch.get_last_lr()[0]
+                    }, step=step)
+
+                running_reward = 0.0
+
+        os.makedirs(args.out_dir, exist_ok=True)
+        torch.save(model.policy.state_dict(), os.path.join(args.out_dir, "policy.pt"))
+        print(f"[train_policy] saved policy to {args.out_dir}")
+
+        if tracker:
+            tracker.log_model(args.out_dir, "policy_model")
+
+    finally:
+        if tracker:
+            tracker.end_run()
 
 
 def cmd_generate(args):
@@ -832,6 +1024,11 @@ def build_argparser():
     sp.add_argument("--lr", type=float, default=2e-5)
     sp.add_argument("--log_every", type=int, default=50)
     sp.add_argument("--out_dir", type=str, default="runs/cpt_recon")
+    # MLflow arguments
+    sp.add_argument("--use-mlflow", action="store_true", help="Enable MLflow tracking")
+    sp.add_argument("--mlflow-uri", type=str, default="mlruns", help="MLflow tracking URI")
+    sp.add_argument("--experiment", type=str, default="REFRAG", help="MLflow experiment name")
+    sp.add_argument("--run-name", type=str, default="run", help="MLflow run name")
     sp.set_defaults(func=cmd_cpt_recon)
 
     # cpt_next
@@ -846,6 +1043,11 @@ def build_argparser():
     sp.add_argument("--log_every", type=int, default=50)
     sp.add_argument("--load_dir", type=str, default="", help="Optional: dir with encoder.pt/projector.pt")
     sp.add_argument("--out_dir", type=str, default="runs/cpt_next")
+    # MLflow arguments
+    sp.add_argument("--use-mlflow", action="store_true", help="Enable MLflow tracking")
+    sp.add_argument("--mlflow-uri", type=str, default="mlruns", help="MLflow tracking URI")
+    sp.add_argument("--experiment", type=str, default="REFRAG", help="MLflow experiment name")
+    sp.add_argument("--run-name", type=str, default="run", help="MLflow run name")
     sp.set_defaults(func=cmd_cpt_next)
 
     # train_policy
@@ -864,6 +1066,11 @@ def build_argparser():
     sp.add_argument("--log_every", type=int, default=50)
     sp.add_argument("--load_dir", type=str, default="", help="Optional: dir with encoder.pt/projector.pt")
     sp.add_argument("--out_dir", type=str, default="runs/policy")
+    # MLflow arguments
+    sp.add_argument("--use-mlflow", action="store_true", help="Enable MLflow tracking")
+    sp.add_argument("--mlflow-uri", type=str, default="mlruns", help="MLflow tracking URI")
+    sp.add_argument("--experiment", type=str, default="REFRAG", help="MLflow experiment name")
+    sp.add_argument("--run-name", type=str, default="run", help="MLflow run name")
     sp.set_defaults(func=cmd_train_policy)
 
     # generate
