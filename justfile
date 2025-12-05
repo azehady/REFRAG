@@ -262,19 +262,50 @@ v2-full-train data_dir="data" index_dir="runs/index":
     @echo ""
     @echo "=== Training Complete ==="
 
+# REFRAG v2 Quickstart - Full pipeline with evaluation
+v2-quickstart:
+    ./scripts/refrag_v2_quickstart.sh
+
+# REFRAG v2 Quickstart with MLflow
+v2-quickstart-mlflow:
+    ./scripts/refrag_v2_quickstart.sh --mlflow
+
+# REFRAG v2 Quickstart - Evaluation only (use existing checkpoints)
+v2-quickstart-eval:
+    ./scripts/refrag_v2_quickstart.sh --eval-only
+
+# REFRAG v2 Quickstart - Skip policy training
+v2-quickstart-fast:
+    ./scripts/refrag_v2_quickstart.sh --skip-policy
+
 # ============================================================================
 # Comparison & Analysis
 # ============================================================================
 
-# Compare RAG vs REFRAG on same dataset
-compare test_json="data/rag_train.jsonl" rag_index="runs/rag_index" refrag_index="runs/index" refrag_model="runs/cpt_next":
-    @echo "=== Evaluating Standard RAG ==="
-    just rag-eval-mlflow {{rag_index}} {{test_json}} 4 compare_rag
-    @echo ""
-    @echo "=== Evaluating REFRAG ==="
-    python src/refrag.py generate --index_dir {{refrag_index}} --question "test" --load_dir {{refrag_model}}
-    @echo ""
-    @echo "Check MLflow UI for comparison: http://localhost:5000"
+# Full comparison: RAG vs REFRAG v1 vs REFRAG v2
+compare test_json="data/rag_eval_test.jsonl" max_samples="20":
+    uv run python eval/evaluate_comparison.py \
+        --test_json {{test_json}} \
+        --max_samples {{max_samples}} \
+        --output runs/comparison_results.json
+
+# Compare RAG vs REFRAG v1 only (skip v2)
+compare-v1 test_json="data/rag_eval_test.jsonl" max_samples="20":
+    uv run python eval/evaluate_comparison.py \
+        --test_json {{test_json}} \
+        --max_samples {{max_samples}} \
+        --skip_refrag_v2 \
+        --output runs/comparison_v1_results.json
+
+# Compare with custom model paths
+compare-full test_json="data/rag_eval_test.jsonl" rag_index="runs/rag_index" refrag_load="runs/policy_aligned" v2_load="runs/refrag_v2_cpt" max_samples="20":
+    uv run python eval/evaluate_comparison.py \
+        --test_json {{test_json}} \
+        --rag_index {{rag_index}} \
+        --refrag_load {{refrag_load}} \
+        --refrag_v2_load {{v2_load}} \
+        --max_samples {{max_samples}} \
+        --output runs/comparison_full_results.json
 
 # ============================================================================
 # Utilities

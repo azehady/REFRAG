@@ -74,13 +74,36 @@ except ImportError:
     FAISS_AVAILABLE = False
     faiss = None
 
-# Logging setup
+# Logging setup - force unbuffered output
+import sys
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ],
+    force=True  # Override any existing configuration
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Enable debug logging to catch CPT loss details
+
+
+def setup_file_logging(output_dir: str, name: str = "training"):
+    """Setup file logging to output directory."""
+    log_dir = os.path.join(output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(file_handler)
+
+    logger.info(f"Logging to: {log_file}")
+    return log_file
 
 
 # ============================================================================
@@ -117,8 +140,8 @@ class REFRAGConfig:
     # k=64: too aggressive (62× speedup, -8.5% accuracy)
     chunk_size_k: int = 16  # RECOMMENDED: best speed/quality tradeoff
     db_chunk_size: int = 256  # DB-level chunk size (passages)
-    max_context_tokens: int = 2048  # s tokens
-    max_output_tokens: int = 2048  # o tokens
+    max_context_tokens: int = 128  # s tokens (reduced for small datasets)
+    max_output_tokens: int = 128  # o tokens (reduced for small datasets)
     max_query_tokens: int = 256
 
     # Selective expansion
@@ -128,7 +151,8 @@ class REFRAGConfig:
     batch_size: int = 8  # Paper uses 256, adjust for hardware
     gradient_accumulation_steps: int = 32  # Effective batch = 256
     lr_reconstruction: float = 2e-4  # Paper: 2e-4 for reconstruction
-    lr_cpt: float = 5e-5  # Paper: 5e-5 for CPT
+    lr_cpt: float = 1e-5  # Reduced from 5e-5 to prevent gradient explosion
+    lr_cpt_decoder: float = 5e-7  # Very low LR for decoder to prevent gradient explosion
     lr_finetune: float = 2e-5  # Paper: 2e-5 for downstream
     lr_policy: float = 1e-4
     weight_decay: float = 0.0
@@ -145,7 +169,7 @@ class REFRAGConfig:
     ppo_clip_epsilon: float = 0.2
 
     # Hardware
-    fp16: bool = True
+    fp16: bool = False  # Disabled fp16 to fix NaN issues during CPT training
     seed: int = 1337
 
     # MLflow
@@ -375,10 +399,20 @@ class PassageRetriever:
         ensure_faiss()
 
         self.index = faiss.read_index(index_path)
-        self.passages = np.load(
-            index_path.replace('.index', '_passages.npy'),
-            allow_pickle=True
-        ).tolist()
+
+        # Try different passage file formats for compatibility
+        passages_path = index_path.replace('.index', '_passages.npy')
+        texts_path = os.path.join(os.path.dirname(index_path), 'texts.npy')
+
+        if os.path.exists(passages_path):
+            self.passages = np.load(passages_path, allow_pickle=True).tolist()
+        elif os.path.exists(texts_path):
+            # REFRAG v1 format
+            self.passages = np.load(texts_path, allow_pickle=True).tolist()
+        else:
+            raise FileNotFoundError(
+                f"Could not find passages file. Tried: {passages_path}, {texts_path}"
+            )
 
         logger.info(f"Loaded index with {len(self.passages)} passages")
 
@@ -448,14 +482,39 @@ class ProjectionLayer(nn.Module):
 
     def __init__(self, encoder_dim: int, decoder_dim: int):
         super().__init__()
+        # Core projection without LayerNorm (for checkpoint compatibility)
         self.projection = nn.Sequential(
             nn.Linear(encoder_dim, decoder_dim),
             nn.GELU(),
             nn.Linear(decoder_dim, decoder_dim),
         )
+        # Learnable scaling parameters to match decoder embedding statistics
+        # Initialized to identity transform (scale=1, shift=0)
+        self.scale = nn.Parameter(torch.ones(1))
+        self.shift = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.projection(x)
+    def forward(self, x: torch.Tensor, target_stats: Optional[Tuple[float, float]] = None) -> torch.Tensor:
+        """
+        Project encoder embeddings to decoder space.
+
+        Args:
+            x: Input embeddings from encoder
+            target_stats: Optional (mean, std) of target decoder embeddings for normalization
+        """
+        out = self.projection(x)
+
+        # Apply learned scaling
+        out = out * self.scale + self.shift
+
+        # If target stats provided, normalize to match decoder embedding distribution
+        if target_stats is not None:
+            target_mean, target_std = target_stats
+            out_mean = out.mean()
+            out_std = out.std() + 1e-8
+            # Normalize and rescale to target distribution
+            out = (out - out_mean) / out_std * target_std + target_mean
+
+        return out
 
 
 class ExpansionPolicy(nn.Module):
@@ -623,6 +682,17 @@ class REFRAGModel(nn.Module):
         """Get decoder token embeddings."""
         return self.decoder.get_input_embeddings()(input_ids)
 
+    def _get_decoder_embedding_stats(self) -> Tuple[float, float]:
+        """
+        Get mean and std of decoder embedding layer for normalization.
+        This helps projected embeddings match the decoder's expected scale.
+        """
+        embed_weight = self.decoder.get_input_embeddings().weight
+        with torch.no_grad():
+            mean = embed_weight.mean().item()
+            std = embed_weight.std().item()
+        return (mean, std)
+
     def _chunk_tokens(self, input_ids: torch.Tensor, k: int) -> List[torch.Tensor]:
         """Split token sequence into k-sized chunks."""
         ids = input_ids.squeeze(0) if input_ids.dim() > 1 else input_ids
@@ -690,9 +760,17 @@ class REFRAGModel(nn.Module):
             # Get embeddings for target tokens (shifted)
             target_embs = self._get_decoder_embeddings(target_ids[:-1].unsqueeze(0))  # [1, T-1, D]
 
+            # Convert compressed_emb to match decoder dtype (fp16 if decoder is in fp16)
+            # Clamp to fp16 range first to prevent overflow (fp16 max is ~65504)
+            decoder_dtype = next(self.decoder.parameters()).dtype
+            emb_to_concat = compressed_emb.unsqueeze(1)
+            if decoder_dtype == torch.float16:
+                emb_to_concat = emb_to_concat.clamp(-65000, 65000)
+            emb_to_concat = emb_to_concat.to(dtype=decoder_dtype)
+
             # Concatenate: compressed embedding + token embeddings
             input_embs = torch.cat([
-                compressed_emb.unsqueeze(1),  # [1, 1, D]
+                emb_to_concat,  # [1, 1, D]
                 target_embs  # [1, T-1, D]
             ], dim=1)  # [1, T, D]
 
@@ -723,8 +801,8 @@ class REFRAGModel(nn.Module):
     def compute_cpt_loss(
         self,
         text: str,
-        s: int = 2048,
-        o: int = 2048,
+        s: int = 128,
+        o: int = 128,
         expand_fraction: float = 0.0
     ) -> torch.Tensor:
         """
@@ -738,60 +816,71 @@ class REFRAGModel(nn.Module):
         """
         k = self.config.chunk_size_k
 
-        # Tokenize
+        # Tokenize the full text (get as many tokens as available)
         input_ids = self._tokenize_text(text, s + o)
         ids = input_ids.squeeze(0)
 
-        if len(ids) < s + 2:
+        total_len = len(ids)
+
+        # Adaptive split: use half for context, half for output if text is short
+        if total_len < k + 4:
+            # Text too short even for one chunk + minimal output
+            logger.debug(f"CPT skipped: total_len={total_len} < k+4={k+4}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        # Split context and output
-        context_ids = ids[:s]
-        output_ids = ids[s:s+o]
+        # Dynamically determine context/output split
+        actual_s = min(s, total_len // 2)
+        actual_o = min(o, total_len - actual_s)
 
-        if len(output_ids) < 2:
+        # Ensure we have at least one chunk worth of context
+        actual_s = max(actual_s, k)
+        actual_o = max(actual_o, 2)
+
+        if actual_s + actual_o > total_len:
+            actual_s = total_len - actual_o
+
+        # Split context and output
+        context_ids = ids[:actual_s]
+        output_ids = ids[actual_s:actual_s + actual_o]
+
+        if len(output_ids) < 2 or len(context_ids) < k:
+            logger.debug(f"CPT skipped: output_ids={len(output_ids)}, context_ids={len(context_ids)}, k={k}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # Chunk the context
         context_chunks = self._chunk_tokens(context_ids, k)
         chunk_texts = self._chunks_to_text(context_chunks)
 
-        # Encode and project chunks
-        with torch.no_grad() if expand_fraction == 0 else torch.enable_grad():
-            chunk_embeddings = self.encoder(chunk_texts, device=self.device)
+        # Encode and project chunks - encoder always needs gradients for CPT
+        chunk_embeddings = self.encoder(chunk_texts, device=self.device)
+
+        # Project to decoder space - don't use target_stats normalization as it can cause NaN
+        # The learned scale/shift in projector should be sufficient after reconstruction training
         projected = self.projector(chunk_embeddings)  # [L, D_dec]
+
+        # Safety check for NaN/Inf
+        if torch.isnan(projected).any() or torch.isinf(projected).any():
+            logger.debug("CPT skipped: NaN/Inf in projected embeddings")
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         L = len(context_chunks)
 
-        # Determine which chunks to expand
-        if expand_fraction > 0 and L > 0:
-            num_expand = max(1, int(expand_fraction * L))
-            # Expand chunks with most tokens (heuristic during CPT)
-            chunk_lens = [len(c) for c in context_chunks]
-            expand_indices = sorted(range(L), key=lambda i: chunk_lens[i], reverse=True)[:num_expand]
-            expand_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
-            expand_mask[expand_indices] = True
-        else:
-            expand_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
-
-        # Build input sequence
-        input_parts = []
-        for i, chunk_ids in enumerate(context_chunks):
-            if expand_mask[i]:
-                # Expand: use full token embeddings
-                chunk_embs = self._get_decoder_embeddings(chunk_ids.unsqueeze(0).to(self.device))
-                input_parts.append(chunk_embs.squeeze(0))  # [T_i, D]
-            else:
-                # Compress: use single projected embedding
-                input_parts.append(projected[i:i+1, :])  # [1, D]
-
-        if len(input_parts) == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-
-        context_embs = torch.cat(input_parts, dim=0).unsqueeze(0)  # [1, T_ctx, D]
+        # CPT training strategy: Use ONLY compressed embeddings (all chunks compressed)
+        # This matches reconstruction training and avoids scale mismatch issues that
+        # occur when mixing projected embeddings with token embeddings.
+        # The expand_fraction parameter is ignored during training - expansion is only
+        # used at inference time via the policy network.
+        context_embs = projected.unsqueeze(0)  # [1, L, D_dec] - all compressed
 
         # Get output embeddings (shifted for teacher forcing)
         output_embs = self._get_decoder_embeddings(output_ids[:-1].unsqueeze(0).to(self.device))
+
+        # Convert context_embs to match decoder dtype (fp16 if decoder is in fp16)
+        # Clamp to fp16 range first to prevent overflow (fp16 max is ~65504)
+        decoder_dtype = next(self.decoder.parameters()).dtype
+        if decoder_dtype == torch.float16:
+            context_embs = context_embs.clamp(-65000, 65000)
+        context_embs = context_embs.to(dtype=decoder_dtype)
 
         # Full input: context + output
         full_input = torch.cat([context_embs, output_embs], dim=1)
@@ -812,6 +901,7 @@ class REFRAGModel(nn.Module):
             labels=labels
         )
 
+        logger.debug(f"CPT loss: {outputs.loss.item():.4f}, context_len={context_len}, output_len={len(output_ids)}")
         return outputs.loss
 
     # -------------------------------------------------------------------------
@@ -1080,7 +1170,8 @@ Answer:"""
         checkpoint = torch.load(os.path.join(path, 'checkpoint.pt'), map_location=self.device)
 
         self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
-        self.projector.load_state_dict(checkpoint['projector_state_dict'])
+        # Load projector with strict=False to handle missing scale/shift params in old checkpoints
+        self.projector.load_state_dict(checkpoint['projector_state_dict'], strict=False)
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
 
         if load_decoder:
@@ -1160,9 +1251,15 @@ def train_reconstruction(
     Stage 1: Reconstruction training with curriculum learning.
     Freezes decoder, trains encoder + projector.
     """
+    # Setup file logging
+    os.makedirs(output_dir, exist_ok=True)
+    setup_file_logging(output_dir, "reconstruction")
+
     logger.info("=" * 50)
     logger.info("Stage 1: Reconstruction Training")
     logger.info("=" * 50)
+    logger.info(f"Config: lr={config.lr_reconstruction}, batch={config.batch_size}, stages={config.num_curriculum_stages}")
+    sys.stdout.flush()
 
     model.freeze_decoder()
     model.train()
@@ -1233,9 +1330,11 @@ def train_reconstruction(
                 running_loss += batch_loss.item() * config.gradient_accumulation_steps
                 global_step += 1
 
-                if global_step % 50 == 0:
-                    avg_loss = running_loss / 50
+                # Log every 10 steps for better visibility
+                if global_step % 10 == 0:
+                    avg_loss = running_loss / max(1, min(10, global_step))
                     logger.info(f"Step {global_step} | Stage {stage} | Loss: {avg_loss:.4f}")
+                    sys.stdout.flush()
 
                     if tracker:
                         tracker.log_metrics({
@@ -1263,9 +1362,15 @@ def train_cpt(
     Stage 2: Continual Pre-Training (next-paragraph prediction).
     Unfreezes decoder, trains all parameters.
     """
+    # Setup file logging
+    os.makedirs(output_dir, exist_ok=True)
+    setup_file_logging(output_dir, "cpt")
+
     logger.info("=" * 50)
     logger.info("Stage 2: Continual Pre-Training")
     logger.info("=" * 50)
+    logger.info(f"Config: lr={config.lr_cpt}, lr_decoder={config.lr_cpt_decoder}, batch={config.batch_size}, stages={config.num_curriculum_stages}")
+    sys.stdout.flush()
 
     model.unfreeze_decoder()
     model.train()
@@ -1273,10 +1378,29 @@ def train_cpt(
     # Load data
     dataset = CPTDataset(data_path, model.decoder_tokenizer)
 
-    # Setup optimizer (all parameters)
+    # CPT Strategy: Only fine-tune the decoder
+    # Encoder and projector were already trained in reconstruction - keep them frozen
+    # This prevents gradient explosion from scale mismatch between encoder/projector/decoder
+    for param in model.encoder.parameters():
+        param.requires_grad = False
+    for param in model.projector.parameters():
+        param.requires_grad = False
+
+    # Only train decoder and policy
+    param_groups = [
+        {
+            'params': model.decoder.parameters(),
+            'lr': config.lr_cpt_decoder  # Low LR for decoder
+        },
+        {
+            'params': model.policy.parameters(),
+            'lr': config.lr_cpt
+        }
+    ]
+    logger.info(f"Learning rates: decoder={config.lr_cpt_decoder}, policy={config.lr_cpt}"
+                f" (encoder/projector frozen)")
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.lr_cpt,
+        param_groups,
         weight_decay=config.weight_decay
     )
 
@@ -1328,20 +1452,43 @@ def train_cpt(
 
                 batch_loss = batch_loss / len(batch_indices)
                 batch_loss = batch_loss / config.gradient_accumulation_steps
+
+                # Check for NaN loss and skip if detected
+                if torch.isnan(batch_loss) or torch.isinf(batch_loss):
+                    logger.warning(f"NaN/Inf loss detected at step {global_step}, skipping batch")
+                    optimizer.zero_grad()
+                    continue
+
                 batch_loss.backward()
 
-                if (global_step + 1) % config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
+                # Clip gradients after EACH backward to prevent explosion during accumulation
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
 
-                running_loss += batch_loss.item() * config.gradient_accumulation_steps
+                # For CPT, update immediately without gradient accumulation to prevent explosion
+                # Check for NaN gradients before optimizer step
+                has_nan_grad = False
+                for param in model.parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        has_nan_grad = True
+                        break
+
+                if has_nan_grad:
+                    logger.warning(f"NaN/Inf gradients detected at step {global_step}, skipping update")
+                    optimizer.zero_grad()
+                    continue
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                running_loss += batch_loss.item()
                 global_step += 1
 
-                if global_step % 50 == 0:
-                    avg_loss = running_loss / 50
-                    logger.info(f"Step {global_step} | Stage {stage} | Loss: {avg_loss:.4f}")
+                # Log every 10 steps for better visibility
+                if global_step % 10 == 0:
+                    avg_loss = running_loss / 10.0
+                    logger.info(f"Step {global_step} | Stage {stage} | Loss: {avg_loss:.4f} | expand_frac: {expand_frac:.2f}")
+                    sys.stdout.flush()
 
                     if tracker:
                         tracker.log_metrics({
@@ -1354,7 +1501,10 @@ def train_cpt(
                     running_loss = 0.0
 
     # Save checkpoint
+    logger.info(f"Saving CPT checkpoint to {output_dir}")
     model.save_checkpoint(output_dir, optimizer, step=global_step)
+    logger.info("CPT training complete!")
+    sys.stdout.flush()
 
     return global_step
 
@@ -1626,6 +1776,7 @@ def cmd_train_cpt(args):
         decoder_name=args.decoder,
         chunk_size_k=args.k,
         lr_cpt=args.lr,
+        lr_cpt_decoder=args.lr_decoder,
         batch_size=args.batch_size,
         num_curriculum_stages=args.stages,
         mlflow_tracking_uri=args.mlflow_uri,
@@ -1811,6 +1962,8 @@ def build_parser():
     cpt.add_argument('--out-dir', type=str, required=True)
     cpt.add_argument('--load-dir', type=str, required=True, help='Reconstruction checkpoint')
     cpt.add_argument('--lr', type=float, default=5e-5)
+    cpt.add_argument('--lr-decoder', type=float, default=1e-6,
+                     help='Lower LR for decoder to prevent gradient explosion')
     cpt.add_argument('--batch-size', type=int, default=8)
     cpt.add_argument('--stages', type=int, default=9)
     cpt.set_defaults(func=cmd_train_cpt)
