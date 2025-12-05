@@ -311,6 +311,7 @@ class REFRAG(nn.Module):
 
         self.eos_id = self.decoder_tok.eos_token_id
         self.pad_id = self.decoder_tok.pad_token_id or self.decoder_tok.eos_token_id
+        self.bos_id = self.decoder_tok.bos_token_id or self.decoder_tok.eos_token_id
 
     def _tokenize(self, text: str, max_len: int) -> Dict[str, torch.Tensor]:
         return self.decoder_tok(text, truncation=True, max_length=max_len, padding=False, return_tensors="pt")
@@ -372,12 +373,18 @@ class REFRAG(nn.Module):
         return mask
 
     def build_decoder_inputs(self, question: str, passages: List[str], k: int, p: float, use_policy: bool = True) -> Tuple[torch.Tensor, Dict]:
-        # 1) Question
-        q_ids = self._tokenize(question, self.cfg.max_q_tokens).input_ids.to(self.device)
-        q_emb = self._decoder_token_embeddings(q_ids)  # [1,Q,D]
+        # 0) BOS token embedding - critical for LLM to understand sequence start
+        bos_emb = self._decoder_token_embeddings(torch.tensor([[self.bos_id]], device=self.device))  # [1,1,D]
 
-        # 2) Context → chunk
-        ctx_text = "".join(passages)
+        # 1) Instruction prefix - helps the model understand the task
+        instruction = "Use the following passages to answer the question. Be concise and accurate.\n\nPassages:\n"
+        instr_ids = self._tokenize(instruction, 64).input_ids.to(self.device)
+        instr_emb = self._decoder_token_embeddings(instr_ids)  # [1,I,D]
+
+        # 2) Context → chunk (with proper passage formatting like RAG)
+        # Format each passage with a number prefix like RAG does: "[1] passage1\n\n[2] passage2..."
+        formatted_passages = "\n\n".join([f"[{i+1}] {p}" for i, p in enumerate(passages)])
+        ctx_text = formatted_passages
         chunk_strs, chunk_ids = self._chunk_text(ctx_text, k_tokens=k)
         L = len(chunk_strs)
 
@@ -392,18 +399,28 @@ class REFRAG(nn.Module):
         else:
             expand_mask = self._heuristic_select(chunk_ids, q_text=question, p_max=p)
 
-        # 5) Build final embedding sequence
-        seq_embs = [q_emb.squeeze(0)]  # [Q,D]
+        # 5) Build context embeddings (compressed or expanded)
+        ctx_embs = []
         seg_flags = []                 # bookkeeping for diagnostics
         for i, ids in enumerate(chunk_ids):
             if expand_mask[i]:
                 tok_emb = self._decoder_token_embeddings(ids.unsqueeze(0))  # [1,t_i,D]
-                seq_embs.append(tok_emb.squeeze(0))
+                ctx_embs.append(tok_emb.squeeze(0))
                 seg_flags.extend([1] * tok_emb.size(1))
             else:
-                seq_embs.append(ecnk[i].unsqueeze(0))  # single compressed slot
+                ctx_embs.append(ecnk[i].unsqueeze(0))  # single compressed slot
                 seg_flags.append(0)
+
+        # 6) Question with "Answer:" suffix to prime generation
+        q_prompt = f"\n\nQuestion: {question}\n\nAnswer:"
+        q_ids = self._tokenize(q_prompt, self.cfg.max_q_tokens).input_ids.to(self.device)
+        q_emb = self._decoder_token_embeddings(q_ids)  # [1,Q,D]
+
+        # 7) Final sequence: BOS → Instruction → Context → Question
+        # Order: [BOS][instruction][compressed/expanded context][question + Answer:]
+        seq_embs = [bos_emb.squeeze(0), instr_emb.squeeze(0)] + ctx_embs + [q_emb.squeeze(0)]
         final = torch.cat(seq_embs, dim=0).unsqueeze(0)  # [1, T', D]
+
         extras = {
             "expand_mask": expand_mask.detach().cpu().numpy().tolist(),
             "num_chunks": L,
@@ -416,6 +433,12 @@ class REFRAG(nn.Module):
                  max_new_tokens: int = 128, temperature: float = 0.0, top_p: float = 1.0,
                  use_policy: bool = True) -> Dict:
         self.decoder.eval()
+
+        # If p >= 1.0 (or very close), use standard RAG-style generation with input_ids
+        # This avoids the inputs_embeds issues that cause hallucinations
+        if p >= 0.99:
+            return self._generate_rag_style(question, passages, max_new_tokens, temperature, top_p)
+
         emb_in, extras = self.build_decoder_inputs(question, passages, k=k, p=p, use_policy=use_policy)
 
         # Prefill → KV cache
@@ -426,10 +449,24 @@ class REFRAG(nn.Module):
 
         generated = []
         ttit_list = []
-        last = torch.tensor([[self.eos_id]], device=self.device)  # drive step-by-step
 
-        for _ in range(max_new_tokens):
-            step_emb = self.decoder.get_input_embeddings()(last)
+        # Get first token from prefill output (not EOS!)
+        logits = out.logits[:, -1, :]
+        if temperature > 0.0:
+            probs = F.softmax(logits / max(temperature, 1e-6), dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+        else:
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+
+        nid = next_id.item()
+        if nid != self.eos_id:
+            generated.append(nid)
+
+        # Continue generating
+        for _ in range(max_new_tokens - 1):
+            if nid == self.eos_id:
+                break
+            step_emb = self.decoder.get_input_embeddings()(next_id)
             t1 = time.time()
             out = self.decoder(inputs_embeds=step_emb, use_cache=True, past_key_values=past_key_values)
             ttit_list.append(time.time() - t1)
@@ -446,7 +483,6 @@ class REFRAG(nn.Module):
             if nid == self.eos_id:
                 break
             generated.append(nid)
-            last = next_id
 
         text = self.decoder_tok.decode(generated, skip_special_tokens=True)
         throughput = (len(generated) / max(sum(ttit_list), 1e-6)) if ttit_list else 0.0
@@ -456,6 +492,63 @@ class REFRAG(nn.Module):
             "TTIT_avg_sec": float(np.mean(ttit_list)) if ttit_list else 0.0,
             "throughput_tok_per_sec": throughput,
             "meta": extras,
+        }
+
+    @torch.no_grad()
+    def _generate_rag_style(self, question: str, passages: List[str],
+                            max_new_tokens: int = 128, temperature: float = 0.0, top_p: float = 1.0) -> Dict:
+        """Standard RAG-style generation using input_ids (no compression/embedding mixing)."""
+        # Build prompt exactly like RAG
+        context = "\n\n".join([f"[{i+1}] {p}" for i, p in enumerate(passages)])
+        prompt = f"""Use the following passages to answer the question. Be concise and accurate.
+
+Passages:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+        inputs = self.decoder_tok(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.cfg.max_ctx_tokens
+        ).to(self.device)
+
+        input_len = inputs.input_ids.shape[1]
+
+        t0 = time.time()
+
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.decoder_tok.pad_token_id or self.decoder_tok.eos_token_id,
+            "eos_token_id": self.eos_id,
+        }
+
+        if temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temperature
+            gen_kwargs["top_p"] = top_p
+        else:
+            gen_kwargs["do_sample"] = False
+
+        outputs = self.decoder.generate(inputs.input_ids, **gen_kwargs)
+
+        ttft = time.time() - t0
+
+        generated_ids = outputs[0][input_len:]
+        text = self.decoder_tok.decode(generated_ids, skip_special_tokens=True).strip()
+
+        num_tokens = len(generated_ids)
+        throughput = num_tokens / max(ttft, 1e-6)
+
+        return {
+            "answer": text,
+            "TTFT_sec": ttft,
+            "TTIT_avg_sec": ttft / max(num_tokens, 1),
+            "throughput_tok_per_sec": throughput,
+            "meta": {"expand_mask": [True] * len(passages), "num_chunks": len(passages), "mode": "rag_style"},
         }
 
     # ----------------------------
