@@ -556,12 +556,12 @@ Answer:"""
     # ----------------------------
     def loss_reconstruction(self, ctx_text: str, k: int, num_chunks_cap: Optional[int] = None) -> torch.Tensor:
         """
-        Train encoder+projector to reconstruct tokens chunk-by-chunk from a single projected vector.
+        Train encoder+projector to reconstruct tokens chunk-by-chunk.
 
-        Implementation detail:
-        For each chunk, we repeat the single projected vector across the chunk length so that
-        inputs_embeds has shape [1, T_chunk, D] to match labels [1, T_chunk]. This resolves the
-        batch/sequence mismatch raised by cross_entropy in HF's causal LM loss.
+        The approach: For each chunk i, we build context from compressed embeddings
+        of chunks [0..i-1] (if any) plus the current chunk's compressed embedding,
+        then predict the tokens of chunk i. This teaches the model to use compressed
+        context sequentially.
         """
         # 1) Chunk the context in decoder token space
         chunk_strs, chunk_ids = self._chunk_text(ctx_text, k_tokens=k)
@@ -576,35 +576,70 @@ Answer:"""
         c = self._encode_chunks(chunk_strs)      # [L, D_enc]
         e = self._project_chunks(c)              # [L, D_dec]
 
-        # 3) Per-chunk reconstruction loss
+        # 3) Per-chunk reconstruction loss with sequential context
         loss_accum = 0.0
         for i, ids in enumerate(chunk_ids):
-            # Labels: shape [1, T]
-            labels = ids.unsqueeze(0).to(self.device)              # [1, T]
-            T = labels.size(1)
+            # Build context: compressed embeddings from previous chunks + current chunk embedding
+            # This creates a sequence: [c0, c1, ..., c_{i-1}, c_i] to predict tokens of chunk i
+            if i == 0:
+                # For first chunk, just use its compressed embedding
+                ctx_emb = e[0].unsqueeze(0).unsqueeze(0)  # [1, 1, D]
+            else:
+                # Use all previous chunk embeddings as context
+                ctx_emb = e[:i+1].unsqueeze(0)  # [1, i+1, D]
 
-            # Inputs: repeat the single compressed vector across T time steps → [1, T, D_dec]
-            # (expand is fine and memory-light; make contiguous to be safe for certain backends)
-            inp_emb = e[i].unsqueeze(0).unsqueeze(1).expand(1, T, -1).contiguous()  # [1, T, D]
+            # Get token embeddings for the chunk we want to reconstruct (teacher forcing)
+            chunk_token_ids = ids.to(self.device)
+            chunk_token_embs = self._decoder_token_embeddings(chunk_token_ids.unsqueeze(0))  # [1, T, D]
 
-            # Optional: attention mask (all ones since we provide T tokens)
-            attn_mask = torch.ones((1, T), dtype=torch.long, device=self.device)
+            # Concatenate: [compressed_context] + [chunk_tokens]
+            full_emb = torch.cat([ctx_emb, chunk_token_embs], dim=1)  # [1, ctx_len + T, D]
 
-            out = self.decoder(inputs_embeds=inp_emb, attention_mask=attn_mask, labels=labels)
+            # Labels: -100 for context positions, actual tokens for reconstruction
+            ctx_len = ctx_emb.size(1)
+            T = chunk_token_ids.size(0)
+            labels = torch.full((1, ctx_len + T), -100, dtype=torch.long, device=self.device)
+            labels[0, ctx_len:] = chunk_token_ids  # Only compute loss on chunk tokens
+
+            out = self.decoder(inputs_embeds=full_emb, labels=labels)
             loss_accum = loss_accum + out.loss
 
         return loss_accum / max(L, 1)
 
 
     def loss_next_para(self, full_text: str, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
-        """Feed first s tokens (compressed) and predict next o tokens (teacher-forced)."""
+        """Feed first s tokens (compressed) and predict next o tokens (teacher-forced).
+
+        If the text is shorter than s+o tokens, we adaptively split it:
+        - Use 80% of tokens for context, 20% for prediction
+        - Minimum: at least 2*k context tokens and k output tokens
+        """
         toks = self.decoder_tok(full_text, truncation=True, max_length=s + o, return_tensors="pt")
         ids = toks.input_ids[0].to(self.device)
-        if ids.size(0) < s + 2:
+        total_len = ids.size(0)
+
+        # Adaptive split: if text is shorter than s+o, use 80/20 split
+        min_ctx = max(2 * k, 32)  # At least 2 chunks for context
+        min_out = max(k, 16)       # At least 1 chunk for output
+
+        if total_len < min_ctx + min_out:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        ctx_ids = ids[:s]
-        out_ids = ids[s:s + o]
+        # Use provided s/o if text is long enough, otherwise adaptive split
+        if total_len >= s + 2:
+            ctx_len = s
+            out_len = min(o, total_len - s)
+        else:
+            # Adaptive: 80% context, 20% output
+            ctx_len = int(total_len * 0.8)
+            out_len = total_len - ctx_len
+            # Ensure minimum sizes
+            if out_len < min_out:
+                out_len = min_out
+                ctx_len = total_len - out_len
+
+        ctx_ids = ids[:ctx_len]
+        out_ids = ids[ctx_len:ctx_len + out_len]
         ctx_str = self.decoder_tok.decode(ctx_ids, skip_special_tokens=True)
 
         chunk_strs, chunk_ids = self._chunk_text(ctx_str, k_tokens=k)
@@ -627,9 +662,20 @@ Answer:"""
                 seq.append(e[i].unsqueeze(0))
         if len(seq) == 0:
             seq.append(self._decoder_token_embeddings(ctx_ids.unsqueeze(0)).squeeze(0))
-        inp = torch.cat(seq, dim=0).unsqueeze(0)
-        labels = out_ids.unsqueeze(0)
-        out = self.decoder(inputs_embeds=inp, labels=labels)
+
+        # Get output token embeddings for teacher forcing
+        out_embs = self._decoder_token_embeddings(out_ids.unsqueeze(0)).squeeze(0)  # [out_len, D]
+
+        # Concatenate: context embeddings + output embeddings
+        ctx_embs = torch.cat(seq, dim=0)  # [ctx_len_compressed, D]
+        full_embs = torch.cat([ctx_embs, out_embs], dim=0)  # [ctx + out, D]
+        inp = full_embs.unsqueeze(0)  # [1, ctx + out, D]
+
+        # Labels: -100 for context positions (no loss), actual token IDs for output
+        ctx_labels = torch.full((ctx_embs.size(0),), -100, dtype=torch.long, device=self.device)
+        full_labels = torch.cat([ctx_labels, out_ids], dim=0).unsqueeze(0)  # [1, ctx + out]
+
+        out = self.decoder(inputs_embeds=inp, labels=full_labels)
         return out.loss
 
     def policy_step(self, question: str, passages: List[str], k: int, max_expand_frac: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -866,7 +912,8 @@ def cmd_cpt_next(args):
             "lr": args.lr,
             "steps": args.steps,
             "expand_frac": args.expand_frac,
-            "phase": "cpt_next_para"
+            "phase": "cpt_next_para",
+            "use_curriculum": args.use_curriculum,
         })
 
     try:
@@ -889,14 +936,39 @@ def cmd_cpt_next(args):
             print("[cpt_next] no data.")
             return
 
+        # Pre-compute max chunks for curriculum learning
+        # Sample a few examples to estimate max chunks
+        sample_max_chunks = 1
+        for ex in random.sample(data, min(10, len(data))):
+            text = ex["tokens"]
+            s = ex.get("split", {}).get("s", 2048)
+            chunk_strs, _ = model._chunk_text(text[:s*4], k_tokens=cfg.chunk_len_tokens)  # Approximate
+            sample_max_chunks = max(sample_max_chunks, len(chunk_strs))
+
+        # Build curriculum schedule if enabled
+        if args.use_curriculum:
+            curriculum = curriculum_schedule(steps, sample_max_chunks)
+            print(f"[cpt_next] curriculum learning enabled: 1 → {sample_max_chunks} chunks over {steps} steps")
+        else:
+            curriculum = None
+
         model.train()
         running_loss = 0.0
         for step in range(steps):
             ex = random.choice(data)
             text = ex["tokens"]
-            s = ex.get("split", {}).get("s", 2048)
-            o = ex.get("split", {}).get("o", 256)
-            loss = model.loss_next_para(text, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
+            s_config = ex.get("split", {}).get("s", 2048)
+            o_config = ex.get("split", {}).get("o", 256)
+
+            # Apply curriculum: limit number of context chunks used
+            if curriculum is not None:
+                # Limit context length based on curriculum
+                # Each chunk is ~k tokens, so limit s to curriculum[step] * k tokens
+                s = min(s_config, curriculum[step] * cfg.chunk_len_tokens)
+            else:
+                s = s_config
+
+            loss = model.loss_next_para(text, s=s, o=o_config, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(params, cfg.grad_clip)
@@ -906,14 +978,18 @@ def cmd_cpt_next(args):
 
             if step % max(1, args.log_every) == 0:
                 avg_loss = running_loss / max(1, args.log_every)
-                print(f"[cpt_next] step {step}/{steps} loss={loss.item():.4f}")
+                curriculum_cap = curriculum[step] if curriculum else "N/A"
+                print(f"[cpt_next] step {step}/{steps} loss={loss.item():.4f} curriculum_chunks={curriculum_cap}")
 
                 if tracker:
-                    tracker.log_metrics({
+                    metrics = {
                         "cpt_loss": loss.item(),
                         "avg_loss": avg_loss,
                         "learning_rate": sch.get_last_lr()[0]
-                    }, step=step)
+                    }
+                    if curriculum:
+                        metrics["curriculum_chunks"] = curriculum[step]
+                    tracker.log_metrics(metrics, step=step)
 
                 running_loss = 0.0
 
@@ -1133,6 +1209,7 @@ def build_argparser():
     sp.add_argument("--steps", type=int, default=1000)
     sp.add_argument("--lr", type=float, default=2e-5)
     sp.add_argument("--expand_frac", type=float, default=0.25, help="Uniform expansion fraction during CPT-B")
+    sp.add_argument("--use-curriculum", action="store_true", help="Enable curriculum learning (CRITICAL for training)")
     sp.add_argument("--log_every", type=int, default=50)
     sp.add_argument("--load_dir", type=str, default="", help="Optional: dir with encoder.pt/projector.pt")
     sp.add_argument("--out_dir", type=str, default="runs/cpt_next")
